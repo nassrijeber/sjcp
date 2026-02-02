@@ -1,67 +1,18 @@
-import org.apache.poi.util.ReplacingInputStream;
+Path downloadZipToLocal(AmazonS3 s3, String bucket, String key) throws IOException {
+    Path localZip = Files.createTempFile("input_", ".zip");
 
-import java.io.*;
-import java.nio.file.*;
-import java.util.zip.ZipEntry;
-import java.util.zip.ZipFile;
+    try (S3Object s3Obj = s3.getObject(bucket, key);
+         InputStream in = s3Obj.getObjectContent();
+         OutputStream out = Files.newOutputStream(localZip,
+                 StandardOpenOption.CREATE,
+                 StandardOpenOption.TRUNCATE_EXISTING)) {
 
-public final class SimpleZipExtractor {
-
-    private static final int BUFFER_SIZE = 64 * 1024;
-    private static final long MAX_UNCOMPRESSED_SIZE =
-            200L * 1024 * 1024 * 1024; // 200 Go, adapte si besoin
-
-    private SimpleZipExtractor() {
-        // util
-    }
-
-    /**
-     * Extrait une entrée précise d'un ZIP local en streaming.
-     * Si lineSeparator est multi-caractères (ex "#@@#"), il est remplacé par '\n' en streaming.
-     */
-    public static String extractSingleEntry(Path zipPath,
-                                            String exactEntryName,
-                                            String lineSeparator,
-                                            Path targetDir) throws IOException {
-
-        try (ZipFile zipFile = new ZipFile(zipPath.toFile())) {
-
-            ZipEntry entry = zipFile.getEntry(exactEntryName);
-            if (entry == null) {
-                throw new FileNotFoundException(
-                        "Entry '" + exactEntryName + "' not found in " + zipPath);
-            }
-
-            Path outPath = targetDir.resolve(
-                    Paths.get(entry.getName()).getFileName().toString()
-            );
-
-            boolean normalize =
-                    lineSeparator != null && lineSeparator.length() > 1;
-
-            try (InputStream rawIn = zipFile.getInputStream(entry);
-                 InputStream in = normalize
-                         ? new ReplacingInputStream(rawIn, lineSeparator, "\n")
-                         : rawIn;
-                 OutputStream out = Files.newOutputStream(
-                         outPath,
-                         StandardOpenOption.CREATE,
-                         StandardOpenOption.TRUNCATE_EXISTING)) {
-
-                byte[] buffer = new byte[BUFFER_SIZE];
-                long total = 0L;
-                int n;
-                while ((n = in.read(buffer)) != -1) {
-                    total += n;
-                    if (total > MAX_UNCOMPRESSED_SIZE) {
-                        throw new IOException("Uncompressed size too large for entry "
-                                              + exactEntryName);
-                    }
-                    out.write(buffer, 0, n);
-                }
-            }
-
-            return outPath.toString();
+        byte[] buf = new byte[64 * 1024];
+        int n;
+        while ((n = in.read(buf)) != -1) {
+            out.write(buf, 0, n);
         }
     }
+
+    return localZip;
 }
