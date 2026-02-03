@@ -1,95 +1,24 @@
-package com.example.utils;
-
-import java.util.Map;
-
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
-import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.execution.QueryExecution;
+import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan;
+import org.apache.spark.sql.catalyst.plans.logical.Statistics;
 
-/**
- * Utility methods to safely control the number of JDBC connections
- * by adjusting the number of Spark partitions before a JDBC write.
- *
- * Idea:
- *   - 1 Spark partition = 1 task = 1 JDBC connection
- *   - Too many partitions => too many concurrent connections => DB overload
- *   - We coalesce down to a reasonable number based on:
- *       * current number of partitions
- *       * Spark parallelism (total cores)
- *       * max DB connections we want to allow
- */
-public final class JdbcPartitioningUtils {
+public final class DatasetUtils {
 
-    private JdbcPartitioningUtils() {
-        // utility class, no instance
-    }
+    private DatasetUtils() {}
 
-    /**
-     * Coalesce the DataFrame to a safe number of partitions for JDBC writes.
-     *
-     * @param df               Input dataframe
-     * @param spark            SparkSession
-     * @param maxDbConnections Max JDBC connections allowed in parallel (e.g. 8, 12, 16)
-     * @param minPartitions    Minimum number of partitions (usually 1)
-     * @return DataFrame coalesced to a suitable number of partitions
-     */
-    public static Dataset<Row> coalesceForJdbc(Dataset<Row> df,
-                                               SparkSession spark,
-                                               int maxDbConnections,
-                                               int minPartitions) {
+    public static boolean isEmptyFast(Dataset<Row> df) {
+        try {
+            QueryExecution qe = df.queryExecution();
+            LogicalPlan optimized = qe.optimizedPlan();
+            Statistics stats = optimized.stats();
+            long size = stats.sizeInBytes().longValue();
 
-        // Current number of partitions
-        int currentPartitions = df.rdd().getNumPartitions();
+            if (size == 0L) return true;
+            if (size > 0L) return false;
+        } catch (Throwable ignore) {}
 
-        // Spark default parallelism (approx. total available cores)
-        int sparkParallelism = spark.sparkContext().defaultParallelism();
-
-        // Compute target partitions:
-        // target = min(currentPartitions, sparkParallelism, maxDbConnections)
-        // then ensure target >= minPartitions
-        int target = Math.min(currentPartitions, sparkParallelism);
-        target = Math.min(target, maxDbConnections);
-        target = Math.max(target, minPartitions);
-
-        if (target < currentPartitions) {
-            // We reduce the number of partitions => coalesce (no full shuffle)
-            return df.coalesce(target);
-        } else {
-            // No need to coalesce, keep original dataframe
-            return df;
-        }
-    }
-
-    /**
-     * Overload with minPartitions = 1 by default.
-     */
-    public static Dataset<Row> coalesceForJdbc(Dataset<Row> df,
-                                               SparkSession spark,
-                                               int maxDbConnections) {
-        return coalesceForJdbc(df, spark, maxDbConnections, 1);
-    }
-
-    /**
-     * Convenience method: coalesce partitions smartly and write via JDBC.
-     *
-     * @param df               DataFrame to write
-     * @param spark            SparkSession
-     * @param maxDbConnections Max JDBC connections allowed in parallel (e.g. 8, 12, 16)
-     * @param jdbcOptions      JDBC options: url, dbtable, user, password, etc.
-     * @param mode             Save mode: "append", "overwrite", "error", "ignore"
-     */
-    public static void writeWithSmartCoalesce(Dataset<Row> df,
-                                              SparkSession spark,
-                                              int maxDbConnections,
-                                              Map<String, String> jdbcOptions,
-                                              String mode) {
-
-        Dataset<Row> coalesced = coalesceForJdbc(df, spark, maxDbConnections);
-
-        coalesced.write()
-                 .format("jdbc")
-                 .options(jdbcOptions)
-                 .mode(mode)
-                 .save();
+        return df.limit(1).rdd().isEmpty();
     }
 }
