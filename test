@@ -1,18 +1,39 @@
-Path downloadZipToLocal(AmazonS3 s3, String bucket, String key) throws IOException {
-    Path localZip = Files.createTempFile("input_", ".zip");
+import java.util.HashMap;
+import java.util.Map;
 
-    try (S3Object s3Obj = s3.getObject(bucket, key);
-         InputStream in = s3Obj.getObjectContent();
-         OutputStream out = Files.newOutputStream(localZip,
-                 StandardOpenOption.CREATE,
-                 StandardOpenOption.TRUNCATE_EXISTING)) {
+import org.apache.spark.sql.Dataset;
+import org.apache.spark.sql.Row;
+import org.apache.spark.sql.SparkSession;
 
-        byte[] buf = new byte[64 * 1024];
-        int n;
-        while ((n = in.read(buf)) != -1) {
-            out.write(buf, 0, n);
-        }
-    }
+// ...
 
-    return localZip;
-}
+SparkSession spark = SparkSession.builder()
+    .appName("MyJdbcJob")
+    .getOrCreate();
+
+// df = ton Dataset<Row> après tes transformations
+Dataset<Row> df = ...;
+
+// Tu peux lire une conf Spark si tu veux le rendre dynamique :
+int maxDbConnections = Integer.parseInt(
+    spark.conf().get("app.jdbc.maxConnections", "8") // default 8
+);
+
+// Options JDBC
+Map<String, String> jdbcOptions = new HashMap<>();
+jdbcOptions.put("url", "jdbc:postgresql://host:5432/mydb");
+jdbcOptions.put("dbtable", "public.my_table");
+jdbcOptions.put("user", "my_user");
+jdbcOptions.put("password", "my_password");
+// tu peux aussi ajouter : batchsize, isolationLevel, etc.
+jdbcOptions.put("batchsize", "5000");
+jdbcOptions.put("isolationLevel", "NONE");
+
+// Écriture avec coalesce intelligent
+JdbcPartitioningUtils.writeWithSmartCoalesce(
+    df,
+    spark,
+    maxDbConnections,
+    jdbcOptions,
+    "append"
+);
