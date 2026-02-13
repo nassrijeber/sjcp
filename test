@@ -1,39 +1,43 @@
-from pyspark.sql import functions as F
-from pyspark.sql.column import Column
+import org.apache.spark.sql.Column;
+import org.apache.spark.sql.functions;
 
-def parquet_safe_value(col_value: Column) -> Column:
-    """
-    Transforme une valeur string en forme 'parquet-safe' :
-    - trim
-    - lowercase
-    - suppression des accents (via normalize NFD + suppression des marks)
-    - remplace tout séparateur en underscore
-    - supprime les caractères non [a-z0-9_]
-    - compacte les underscores
-    - enlève underscores début/fin
-    - si vide => 'col'
-    - si commence par chiffre => prefix 'c_'
-    """
-    s = F.trim(col_value.cast("string"))
-    s = F.lower(s)
+import static org.apache.spark.sql.functions.*;
 
-    # Supprimer accents : NFD puis enlever les "combining marks"
-    s = F.regexp_replace(F.expr("normalize({}, 'NFD')".format(s._jc.toString())), r"\p{M}", "")
+public class PivotSanitizer {
 
-    # Remplacer séparateurs courants + espaces par underscore
-    s = F.regexp_replace(s, r"[\s\-/\.]+", "_")
+  private static String q(String colName) {
+    // Quote avec backticks pour gérer espaces / caractères spéciaux dans le NOM de colonne
+    return "`" + colName.replace("`", "``") + "`";
+  }
 
-    # Supprimer tout sauf a-z 0-9 _
-    s = F.regexp_replace(s, r"[^a-z0-9_]", "")
+  /**
+   * Transforme le CONTENU d'une colonne (valeur) en clé safe pour pivot/Parquet.
+   */
+  public static Column parquetSafeValue(String valueColName) {
 
-    # Compact underscores + trim
-    s = F.regexp_replace(s, r"_+", "_")
-    s = F.regexp_replace(s, r"^_+|_+$", "")
+    // 1) cast string + trim + lower
+    Column s = lower(trim(col(valueColName).cast("string")));
 
-    # Fallback si vide / null
-    s = F.when((s.isNull()) | (s == ""), F.lit("col")).otherwise(s)
+    // 2) supprimer accents: normalize NFD + enlever les "combining marks" \p{M}
+    // normalize() existe sur Spark 3.x (fonction SQL)
+    s = regexp_replace(expr("normalize(" + "cast(" + q(valueColName) + " as string)" + ", 'NFD')"), "\\p{M}", "");
 
-    # Préfixe si commence par un chiffre
-    s = F.when(s.rlike(r"^[0-9]"), F.concat(F.lit("c_"), s)).otherwise(s)
+    // 3) remplacer séparateurs/espaces par underscore
+    s = regexp_replace(s, "[\\s\\-/\\.]+", "_");
 
-    return s
+    // 4) enlever tout sauf [a-z0-9_]
+    s = regexp_replace(s, "[^a-z0-9_]", "");
+
+    // 5) compacter underscores + trim underscores
+    s = regexp_replace(s, "_+", "_");
+    s = regexp_replace(s, "^_+|_+$", "");
+
+    // 6) fallback si null/vide
+    s = when(s.isNull().or(s.equalTo("")), lit("col")).otherwise(s);
+
+    // 7) si commence par chiffre => prefix c_
+    s = when(s.rlike("^[0-9]"), concat(lit("c_"), s)).otherwise(s);
+
+    return s;
+  }
+}
