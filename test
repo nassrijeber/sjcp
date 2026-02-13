@@ -1,24 +1,39 @@
-import org.apache.spark.sql.Dataset;
-import org.apache.spark.sql.Row;
-import org.apache.spark.sql.execution.QueryExecution;
-import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan;
-import org.apache.spark.sql.catalyst.plans.logical.Statistics;
+from pyspark.sql import functions as F
+from pyspark.sql.column import Column
 
-public final class DatasetUtils {
+def parquet_safe_value(col_value: Column) -> Column:
+    """
+    Transforme une valeur string en forme 'parquet-safe' :
+    - trim
+    - lowercase
+    - suppression des accents (via normalize NFD + suppression des marks)
+    - remplace tout séparateur en underscore
+    - supprime les caractères non [a-z0-9_]
+    - compacte les underscores
+    - enlève underscores début/fin
+    - si vide => 'col'
+    - si commence par chiffre => prefix 'c_'
+    """
+    s = F.trim(col_value.cast("string"))
+    s = F.lower(s)
 
-    private DatasetUtils() {}
+    # Supprimer accents : NFD puis enlever les "combining marks"
+    s = F.regexp_replace(F.expr("normalize({}, 'NFD')".format(s._jc.toString())), r"\p{M}", "")
 
-    public static boolean isEmptyFast(Dataset<Row> df) {
-        try {
-            QueryExecution qe = df.queryExecution();
-            LogicalPlan optimized = qe.optimizedPlan();
-            Statistics stats = optimized.stats();
-            long size = stats.sizeInBytes().longValue();
+    # Remplacer séparateurs courants + espaces par underscore
+    s = F.regexp_replace(s, r"[\s\-/\.]+", "_")
 
-            if (size == 0L) return true;
-            if (size > 0L) return false;
-        } catch (Throwable ignore) {}
+    # Supprimer tout sauf a-z 0-9 _
+    s = F.regexp_replace(s, r"[^a-z0-9_]", "")
 
-        return df.limit(1).rdd().isEmpty();
-    }
-}
+    # Compact underscores + trim
+    s = F.regexp_replace(s, r"_+", "_")
+    s = F.regexp_replace(s, r"^_+|_+$", "")
+
+    # Fallback si vide / null
+    s = F.when((s.isNull()) | (s == ""), F.lit("col")).otherwise(s)
+
+    # Préfixe si commence par un chiffre
+    s = F.when(s.rlike(r"^[0-9]"), F.concat(F.lit("c_"), s)).otherwise(s)
+
+    return s
