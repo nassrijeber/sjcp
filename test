@@ -1,43 +1,100 @@
-import org.apache.spark.sql.Column;
-import org.apache.spark.sql.functions;
+-- A) institutionId -> company_cross_ref.companyid
+SELECT COUNT(*) nb
+FROM snp.trucost_period_staging p
+JOIN snp.company_cross_ref_staging ccr
+  ON p.institutionid = ccr.companyid
+WHERE ccr.identifiertypeid = '9458';
 
-import static org.apache.spark.sql.functions.*;
+-- B) institutionId -> company_cross_ref.identifierid
+SELECT COUNT(*) nb
+FROM snp.trucost_period_staging p
+JOIN snp.company_cross_ref_staging ccr
+  ON p.institutionid = ccr.identifierid
+WHERE ccr.identifiertypeid = '9458';
 
-public class PivotSanitizer {
+WITH tc_data_item_staging AS (
+  SELECT dataitemid, dataitemname_normalized, dataitemdefinition, magnitude
+  FROM snp.tc_data_item_staging
+  WHERE dataitemid IN ('319425','319530','319427','323613','319433')
+),
+period_staging AS (
+  SELECT
+    periodid,
+    institutionid,
+    reportedcurrencyisocode,
+    tcprimarysectorid,
+    fiscalyear,
+    periodenddate
+  FROM snp.trucost_period_staging
+),
+period_data_staging AS (
+  SELECT periodid, dataitemid, dataitemvalue
+  FROM snp.trucost_period_data_staging
+  WHERE dataitemid IN ('319425','319530','319427','323613','319433')
+),
+period_text_data_staging AS (
+  SELECT periodid, dataitemid, dataitemvaluetext
+  FROM snp.trucost_period_text_data_staging
+  WHERE dataitemid IN ('319425','319530','319427','323613','319433')
+),
+ccr_institution AS (
+  -- mapping institution -> company via identifiertype 9458
+  SELECT companyid, identifierid AS institutionid
+  FROM snp.company_cross_ref_staging
+  WHERE identifiertypeid = '9458'
+),
+ccr_tcuid AS (
+  -- TCUID via identifiertype 21231
+  SELECT companyid, identifierid AS tcuid
+  FROM snp.company_cross_ref_staging
+  WHERE identifiertypeid = '21231'
+)
 
-  private static String q(String colName) {
-    // Quote avec backticks pour gérer espaces / caractères spéciaux dans le NOM de colonne
-    return "`" + colName.replace("`", "``") + "`";
-  }
+SELECT
+  tc.dataitemid,
+  p.institutionid,
+  tcuid.tcuid,                                -- ✅ le vrai TCUID
+  ccr.companyid,                               -- companyId S&P
+  UPPER(tc.dataitemname_normalized) AS dataitemname_normalized,
+  tc.dataitemdefinition,
+  tc.magnitude,
+  pd.dataitemvalue,
+  ptd.dataitemvaluetext,                       -- ✅ texte optionnel
+  p.reportedcurrencyisocode,
+  p.tcprimarysectorid,
+  p.fiscalyear,
+  p.periodenddate
+FROM period_data_staging pd
+JOIN tc_data_item_staging tc
+  ON pd.dataitemid = tc.dataitemid
+JOIN period_staging p
+  ON pd.periodid = p.periodid
+LEFT JOIN period_text_data_staging ptd         -- ✅ LEFT JOIN
+  ON pd.periodid = ptd.periodid
+ AND pd.dataitemid = ptd.dataitemid
+JOIN ccr_institution ccr
+  ON p.institutionid = ccr.institutionid       -- ✅ institutionid ↔ identifierid
+LEFT JOIN ccr_tcuid tcuid
+  ON tcuid.companyid = ccr.companyid;          
 
-  /**
-   * Transforme le CONTENU d'une colonne (valeur) en clé safe pour pivot/Parquet.
-   */
-  public static Column parquetSafeValue(String valueColName) {
+WITH period_staging AS (
+  SELECT periodid, institutionid
+  FROM snp.trucost_period_staging
+),
+ccr AS (
+  SELECT companyid, identifierid, identifiertypeid
+  FROM snp.company_cross_ref_staging
+  WHERE identifiertypeid = '9458'     -- ton type "institution mapping"
+)
+SELECT 'JOIN_on_companyid' AS join_mode, COUNT(*) AS nb
+FROM period_staging p
+JOIN ccr
+  ON p.institutionid = ccr.companyid
 
-    // 1) cast string + trim + lower
-    Column s = lower(trim(col(valueColName).cast("string")));
+UNION ALL
 
-    // 2) supprimer accents: normalize NFD + enlever les "combining marks" \p{M}
-    // normalize() existe sur Spark 3.x (fonction SQL)
-    s = regexp_replace(expr("normalize(" + "cast(" + q(valueColName) + " as string)" + ", 'NFD')"), "\\p{M}", "");
-
-    // 3) remplacer séparateurs/espaces par underscore
-    s = regexp_replace(s, "[\\s\\-/\\.]+", "_");
-
-    // 4) enlever tout sauf [a-z0-9_]
-    s = regexp_replace(s, "[^a-z0-9_]", "");
-
-    // 5) compacter underscores + trim underscores
-    s = regexp_replace(s, "_+", "_");
-    s = regexp_replace(s, "^_+|_+$", "");
-
-    // 6) fallback si null/vide
-    s = when(s.isNull().or(s.equalTo("")), lit("col")).otherwise(s);
-
-    // 7) si commence par chiffre => prefix c_
-    s = when(s.rlike("^[0-9]"), concat(lit("c_"), s)).otherwise(s);
-
-    return s;
-  }
-}
+SELECT 'JOIN_on_identifierid' AS join_mode, COUNT(*) AS nb
+FROM period_staging p
+JOIN ccr
+  ON p.institutionid = ccr.identifierid;
+-- ✅ TCUID via companyid
