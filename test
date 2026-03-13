@@ -1,100 +1,44 @@
--- A) institutionId -> company_cross_ref.companyid
-SELECT COUNT(*) nb
-FROM snp.trucost_period_staging p
-JOIN snp.company_cross_ref_staging ccr
-  ON p.institutionid = ccr.companyid
-WHERE ccr.identifiertypeid = '9458';
+import static org.apache.spark.sql.functions.*;
 
--- B) institutionId -> company_cross_ref.identifierid
-SELECT COUNT(*) nb
-FROM snp.trucost_period_staging p
-JOIN snp.company_cross_ref_staging ccr
-  ON p.institutionid = ccr.identifierid
-WHERE ccr.identifiertypeid = '9458';
+import org.apache.spark.sql.Dataset;
+import org.apache.spark.sql.Row;
+import org.apache.spark.sql.SparkSession;
 
-WITH tc_data_item_staging AS (
-  SELECT dataitemid, dataitemname_normalized, dataitemdefinition, magnitude
-  FROM snp.tc_data_item_staging
-  WHERE dataitemid IN ('319425','319530','319427','323613','319433')
-),
-period_staging AS (
-  SELECT
-    periodid,
-    institutionid,
-    reportedcurrencyisocode,
-    tcprimarysectorid,
-    fiscalyear,
-    periodenddate
-  FROM snp.trucost_period_staging
-),
-period_data_staging AS (
-  SELECT periodid, dataitemid, dataitemvalue
-  FROM snp.trucost_period_data_staging
-  WHERE dataitemid IN ('319425','319530','319427','323613','319433')
-),
-period_text_data_staging AS (
-  SELECT periodid, dataitemid, dataitemvaluetext
-  FROM snp.trucost_period_text_data_staging
-  WHERE dataitemid IN ('319425','319530','319427','323613','319433')
-),
-ccr_institution AS (
-  -- mapping institution -> company via identifiertype 9458
-  SELECT companyid, identifierid AS institutionid
-  FROM snp.company_cross_ref_staging
-  WHERE identifiertypeid = '9458'
-),
-ccr_tcuid AS (
-  -- TCUID via identifiertype 21231
-  SELECT companyid, identifierid AS tcuid
-  FROM snp.company_cross_ref_staging
-  WHERE identifiertypeid = '21231'
-)
+public class ReadOnlyLatestPartition {
 
-SELECT
-  tc.dataitemid,
-  p.institutionid,
-  tcuid.tcuid,                                -- ✅ le vrai TCUID
-  ccr.companyid,                               -- companyId S&P
-  UPPER(tc.dataitemname_normalized) AS dataitemname_normalized,
-  tc.dataitemdefinition,
-  tc.magnitude,
-  pd.dataitemvalue,
-  ptd.dataitemvaluetext,                       -- ✅ texte optionnel
-  p.reportedcurrencyisocode,
-  p.tcprimarysectorid,
-  p.fiscalyear,
-  p.periodenddate
-FROM period_data_staging pd
-JOIN tc_data_item_staging tc
-  ON pd.dataitemid = tc.dataitemid
-JOIN period_staging p
-  ON pd.periodid = p.periodid
-LEFT JOIN period_text_data_staging ptd         -- ✅ LEFT JOIN
-  ON pd.periodid = ptd.periodid
- AND pd.dataitemid = ptd.dataitemid
-JOIN ccr_institution ccr
-  ON p.institutionid = ccr.institutionid       -- ✅ institutionid ↔ identifierid
-LEFT JOIN ccr_tcuid tcuid
-  ON tcuid.companyid = ccr.companyid;          
+    public static void main(String[] args) {
+        SparkSession spark = SparkSession.builder()
+                .appName("Read only latest partition")
+                .getOrCreate();
 
-WITH period_staging AS (
-  SELECT periodid, institutionid
-  FROM snp.trucost_period_staging
-),
-ccr AS (
-  SELECT companyid, identifierid, identifiertypeid
-  FROM snp.company_cross_ref_staging
-  WHERE identifiertypeid = '9458'     -- ton type "institution mapping"
-)
-SELECT 'JOIN_on_companyid' AS join_mode, COUNT(*) AS nb
-FROM period_staging p
-JOIN ccr
-  ON p.institutionid = ccr.companyid
+        String basePath = "s3://mon-bucket/Raw_data/clarity/taxonomy";
 
-UNION ALL
+        Dataset<Row> partitionsDf = spark.read()
+                .option("basePath", basePath)
+                .option("header", "true")
+                .option("inferSchema", "true")
+                .csv(basePath)
+                .select("type_taxonomy", "date")
+                .distinct()
+                .withColumn("date", to_date(col("date"), "yyyy-MM-dd"));
 
-SELECT 'JOIN_on_identifierid' AS join_mode, COUNT(*) AS nb
-FROM period_staging p
-JOIN ccr
-  ON p.institutionid = ccr.identifierid;
--- ✅ TCUID via companyid
+        Row maxDateRow = partitionsDf
+                .agg(max(col("date")).alias("max_date"))
+                .first();
+
+        java.sql.Date maxDate = maxDateRow.getDate(0);
+        String maxDateStr = maxDate.toString();
+
+        String latestPath = basePath + "/*/date=" + maxDateStr + "/";
+
+        Dataset<Row> dfLatest = spark.read()
+                .option("basePath", basePath)
+                .option("header", "true")
+                .option("inferSchema", "true")
+                .csv(latestPath);
+
+        dfLatest.show(false);
+
+        spark.stop();
+    }
+}
