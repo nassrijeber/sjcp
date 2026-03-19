@@ -1,44 +1,64 @@
-import static org.apache.spark.sql.functions.*;
-
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 
-public class ReadOnlyLatestPartition {
+import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
-    public static void main(String[] args) {
-        SparkSession spark = SparkSession.builder()
-                .appName("Read only latest partition")
-                .getOrCreate();
+public class SqlOverrideBuilder {
 
-        String basePath = "s3://mon-bucket/Raw_data/clarity/taxonomy";
+    public static Dataset<Row> applyOverrides(
+            SparkSession spark,
+            Dataset<Row> df,
+            String tempView,
+            String overrideBlock
+    ) {
+        df.createOrReplaceTempView(tempView);
 
-        Dataset<Row> partitionsDf = spark.read()
-                .option("basePath", basePath)
-                .option("header", "true")
-                .option("inferSchema", "true")
-                .csv(basePath)
-                .select("type_taxonomy", "date")
-                .distinct()
-                .withColumn("date", to_date(col("date"), "yyyy-MM-dd"));
+        Map<String, String> overrides = parseOverrideBlock(overrideBlock);
 
-        Row maxDateRow = partitionsDf
-                .agg(max(col("date")).alias("max_date"))
-                .first();
+        List<String> selectParts = new ArrayList<>();
+        for (String col : df.columns()) {
+            selectParts.add(overrides.getOrDefault(col, col));
+        }
 
-        java.sql.Date maxDate = maxDateRow.getDate(0);
-        String maxDateStr = maxDate.toString();
+        String finalSql =
+                "SELECT\n    " +
+                String.join(",\n    ", selectParts) +
+                "\nFROM " + tempView;
 
-        String latestPath = basePath + "/*/date=" + maxDateStr + "/";
+        System.out.println(finalSql);
 
-        Dataset<Row> dfLatest = spark.read()
-                .option("basePath", basePath)
-                .option("header", "true")
-                .option("inferSchema", "true")
-                .csv(latestPath);
+        return spark.sql(finalSql);
+    }
 
-        dfLatest.show(false);
+    private static Map<String, String> parseOverrideBlock(String overrideBlock) {
+        Map<String, String> result = new HashMap<>();
 
-        spark.stop();
+        Pattern aliasPattern = Pattern.compile("(?i)\\bAS\\s+([a-zA-Z_][a-zA-Z0-9_]*)\\s*$");
+
+        String[] lines = overrideBlock.split("\\r?\\n");
+        for (String rawLine : lines) {
+            String line = rawLine.trim();
+
+            if (line.isEmpty()) {
+                continue;
+            }
+
+            if (line.endsWith(",")) {
+                line = line.substring(0, line.length() - 1).trim();
+            }
+
+            Matcher matcher = aliasPattern.matcher(line);
+            if (!matcher.find()) {
+                throw new IllegalArgumentException("Alias introuvable dans : " + line);
+            }
+
+            String colName = matcher.group(1);
+            result.put(colName, line);
+        }
+
+        return result;
     }
 }
