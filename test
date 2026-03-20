@@ -2,63 +2,100 @@ import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 
-import java.util.*;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-public class SqlOverrideBuilder {
+public final class SparkSqlCaseWhenOverrideBuilder {
 
+    private static final Pattern ALIAS_PATTERN =
+            Pattern.compile("(?i)\\bAS\\s+([a-zA-Z_][a-zA-Z0-9_]*)\\s*$");
+
+    private SparkSqlCaseWhenOverrideBuilder() {
+    }
+
+    /**
+     * Construit un SELECT SQL complet en remplaçant uniquement
+     * les colonnes présentes dans le bloc override.
+     *
+     * @param spark         SparkSession
+     * @param sourceDf      DataFrame source
+     * @param tempViewName  nom de la vue temporaire
+     * @param overrideBlock bloc SQL contenant des CASE WHEN séparés par des virgules
+     * @return Dataset<Row> résultat du SQL généré
+     */
     public static Dataset<Row> applyOverrides(
             SparkSession spark,
-            Dataset<Row> df,
-            String tempView,
+            Dataset<Row> sourceDf,
+            String tempViewName,
             String overrideBlock
     ) {
-        df.createOrReplaceTempView(tempView);
+        sourceDf.createOrReplaceTempView(tempViewName);
 
-        Map<String, String> overrides = parseOverrideBlock(overrideBlock);
+        Map<String, String> overridesByColumn = parseOverrideBlock(overrideBlock);
 
-        List<String> selectParts = new ArrayList<>();
-        for (String col : df.columns()) {
-            selectParts.add(overrides.getOrDefault(col, col));
+        List<String> finalSelectParts = new ArrayList<>();
+
+        for (String colName : sourceDf.columns()) {
+            String overrideExpression = overridesByColumn.get(colName);
+            if (overrideExpression != null) {
+                finalSelectParts.add(overrideExpression);
+            } else {
+                finalSelectParts.add("src." + colName);
+            }
         }
 
         String finalSql =
                 "SELECT\n    " +
-                String.join(",\n    ", selectParts) +
-                "\nFROM " + tempView;
+                String.join(",\n    ", finalSelectParts) +
+                "\nFROM " + tempViewName + " src";
 
+        System.out.println("========== GENERATED SQL ==========");
         System.out.println(finalSql);
+        System.out.println("===================================");
 
         return spark.sql(finalSql);
     }
 
+    /**
+     * Parse un bloc SQL de ce type :
+     *
+     * CASE WHEN ... THEN ... ELSE ... END AS col_1,
+     * CASE WHEN ... THEN ... ELSE ... END AS col_2,
+     * CASE WHEN ... THEN ... ELSE ... END AS col_3
+     *
+     * Le split est volontairement simple : séparation par virgule.
+     */
     private static Map<String, String> parseOverrideBlock(String overrideBlock) {
-        Map<String, String> result = new HashMap<>();
+        Map<String, String> overrides = new LinkedHashMap<>();
 
-        Pattern aliasPattern = Pattern.compile("(?i)\\bAS\\s+([a-zA-Z_][a-zA-Z0-9_]*)\\s*$");
+        if (overrideBlock == null || overrideBlock.trim().isEmpty()) {
+            return overrides;
+        }
 
-        String[] lines = overrideBlock.split("\\r?\\n");
-        for (String rawLine : lines) {
-            String line = rawLine.trim();
+        String[] expressions = overrideBlock.split(",");
 
-            if (line.isEmpty()) {
+        for (String rawExpr : expressions) {
+            String expr = rawExpr.trim();
+
+            if (expr.isEmpty()) {
                 continue;
             }
 
-            if (line.endsWith(",")) {
-                line = line.substring(0, line.length() - 1).trim();
-            }
-
-            Matcher matcher = aliasPattern.matcher(line);
+            Matcher matcher = ALIAS_PATTERN.matcher(expr);
             if (!matcher.find()) {
-                throw new IllegalArgumentException("Alias introuvable dans : " + line);
+                throw new IllegalArgumentException(
+                        "Alias introuvable dans l'expression suivante : " + expr
+                );
             }
 
-            String colName = matcher.group(1);
-            result.put(colName, line);
+            String alias = matcher.group(1);
+            overrides.put(alias, expr);
         }
 
-        return result;
+        return overrides;
     }
 }
