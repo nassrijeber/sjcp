@@ -1,101 +1,145 @@
+package com.cacib.ted.integration.processor.custom;
+
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
+import java.util.Set;
 
-public final class SparkSqlCaseWhenOverrideBuilder {
-
-    private static final Pattern ALIAS_PATTERN =
-            Pattern.compile("(?i)\\bAS\\s+([a-zA-Z_][a-zA-Z0-9_]*)\\s*$");
-
-    private SparkSqlCaseWhenOverrideBuilder() {
-    }
+public final class SqlJavaWithColumnsBuilder {
 
     /**
-     * Construit un SELECT SQL complet en remplaçant uniquement
-     * les colonnes présentes dans le bloc override.
-     *
-     * @param spark         SparkSession
-     * @param sourceDf      DataFrame source
-     * @param tempViewName  nom de la vue temporaire
-     * @param overrideBlock bloc SQL contenant des CASE WHEN séparés par des virgules
-     * @return Dataset<Row> résultat du SQL généré
+     * Séparateur entre le nom de colonne cible et l'expression SQL.
+     * Exemple :
+     * my_col ::= COALESCE(a, b)
      */
-    public static Dataset<Row> applyOverrides(
+    private static final String OVERRIDE_SEPARATOR = "::=";
+
+    /**
+     * Séparateur entre deux règles.
+     * Exemple :
+     * col1 ::= expr1
+     * @@@
+     * col2 ::= expr2
+     */
+    private static final String COLUMN_SEPARATOR = "@@@";
+
+    private static final String SQL_TEMPLATE = "SELECT %s FROM %s";
+    private static final String COLUMN_ALIAS_TEMPLATE = "%s AS %s";
+
+    private SqlJavaWithColumnsBuilder() {
+    }
+
+    public static Dataset<Row> applyWithColumns(
             SparkSession spark,
             Dataset<Row> sourceDf,
             String tempViewName,
             String overrideBlock
     ) {
-        sourceDf.createOrReplaceTempView(tempViewName);
+        Map<String, String> overrides = parseWithColumns(overrideBlock);
 
-        Map<String, String> overridesByColumn = parseOverrideBlock(overrideBlock);
+        List<String> selectExpressions = new ArrayList<>();
+        Set<String> existingColumns = new LinkedHashSet<>(Arrays.asList(sourceDf.columns()));
 
-        List<String> finalSelectParts = new ArrayList<>();
+        // 1) Colonnes existantes : on garde ou on remplace
+        for (String sourceColumn : sourceDf.columns()) {
+            String expression = overrides.get(sourceColumn);
+            selectExpressions.add(buildSelectExpression(sourceColumn, expression));
+        }
 
-        for (String colName : sourceDf.columns()) {
-            String overrideExpression = overridesByColumn.get(colName);
-            if (overrideExpression != null) {
-                finalSelectParts.add(overrideExpression);
-            } else {
-                finalSelectParts.add("src." + colName);
+        // 2) Nouvelles colonnes : on les ajoute à la fin
+        for (Map.Entry<String, String> entry : overrides.entrySet()) {
+            String targetColumn = entry.getKey();
+            String expression = entry.getValue();
+
+            if (!existingColumns.contains(targetColumn)) {
+                selectExpressions.add(buildSelectExpression(targetColumn, expression));
             }
         }
 
-        String finalSql =
-                "SELECT\n    " +
-                String.join(",\n    ", finalSelectParts) +
-                "\nFROM " + tempViewName + " src";
+        String selectClause = String.join(",\n    ", selectExpressions);
+        String sql = SQL_TEMPLATE.formatted(selectClause, tempViewName);
 
-        System.out.println("========== GENERATED SQL ==========");
-        System.out.println(finalSql);
-        System.out.println("===================================");
+        return spark.sql(sql);
+    }
 
-        return spark.sql(finalSql);
+    private static String buildSelectExpression(String targetColumn, String expression) {
+        if (expression == null || expression.isBlank()) {
+            return targetColumn;
+        }
+
+        String trimmedExpression = expression.trim();
+
+        // Si l'expression se termine déjà par "AS alias", on la garde telle quelle.
+        if (hasFinalAlias(trimmedExpression)) {
+            return trimmedExpression;
+        }
+
+        return COLUMN_ALIAS_TEMPLATE.formatted(trimmedExpression, targetColumn);
     }
 
     /**
-     * Parse un bloc SQL de ce type :
+     * Détecte uniquement un alias final du type :
+     *   expr AS my_col
+     * ou
+     *   expr AS `my_col`
      *
-     * CASE WHEN ... THEN ... ELSE ... END AS col_1,
-     * CASE WHEN ... THEN ... ELSE ... END AS col_2,
-     * CASE WHEN ... THEN ... ELSE ... END AS col_3
-     *
-     * Le split est volontairement simple : séparation par virgule.
+     * Cela évite de confondre avec :
+     *   CAST(x AS STRING)
      */
-    private static Map<String, String> parseOverrideBlock(String overrideBlock) {
-        Map<String, String> overrides = new LinkedHashMap<>();
+    private static boolean hasFinalAlias(String expression) {
+        String normalized = expression.trim().replaceAll("\\s+", " ");
 
-        if (overrideBlock == null || overrideBlock.trim().isEmpty()) {
-            return overrides;
+        return normalized.matches("(?i)^.+\\s+AS\\s+(`[^`]+`|[a-zA-Z_][a-zA-Z0-9_]*)$");
+    }
+
+    private static Map<String, String> parseWithColumns(String block) {
+        Map<String, String> result = new LinkedHashMap<>();
+
+        if (block == null || block.isBlank()) {
+            return result;
         }
 
-        String[] expressions = overrideBlock.split(",");
+        String[] entries = block.split("(?s)\\s*" + java.util.regex.Pattern.quote(COLUMN_SEPARATOR) + "\\s*");
 
-        for (String rawExpr : expressions) {
-            String expr = rawExpr.trim();
+        for (String entry : entries) {
+            String trimmedEntry = entry.trim();
 
-            if (expr.isEmpty()) {
+            if (trimmedEntry.isEmpty()) {
                 continue;
             }
 
-            Matcher matcher = ALIAS_PATTERN.matcher(expr);
-            if (!matcher.find()) {
+            int separatorIndex = trimmedEntry.indexOf(OVERRIDE_SEPARATOR);
+            if (separatorIndex < 0) {
                 throw new IllegalArgumentException(
-                        "Alias introuvable dans l'expression suivante : " + expr
+                        "Invalid withColumns entry. Missing separator '" + OVERRIDE_SEPARATOR + "' in:\n" + trimmedEntry
                 );
             }
 
-            String alias = matcher.group(1);
-            overrides.put(alias, expr);
+            String targetColumn = trimmedEntry.substring(0, separatorIndex).trim();
+            String expression = trimmedEntry.substring(separatorIndex + OVERRIDE_SEPARATOR.length()).trim();
+
+            if (targetColumn.isEmpty()) {
+                throw new IllegalArgumentException(
+                        "Invalid withColumns entry. Empty target column in:\n" + trimmedEntry
+                );
+            }
+
+            if (expression.isEmpty()) {
+                throw new IllegalArgumentException(
+                        "Invalid withColumns entry. Empty SQL expression for column: " + targetColumn
+                );
+            }
+
+            result.put(targetColumn, expression);
         }
 
-        return overrides;
+        return result;
     }
 }
